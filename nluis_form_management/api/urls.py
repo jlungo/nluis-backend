@@ -1,0 +1,42 @@
+from django.urls import path, include
+from .views import *
+
+app_name="nluis_form_management"
+
+urlpatterns = [
+    path('module/levels/', ModuleLevelListView.as_view(), name='module-level-list'),
+    path('module/levels/create/', ModuleLevelCreateView.as_view(), name='module-level-create'),
+    path('module/levels/<slug:slug>/', ModuleLevelUpdateView.as_view(), name='module-level-update'),
+    path('module/levels/<slug:slug>/delete/', ModuleLevelSoftDeleteView.as_view(), name='module-level-delete'),
+    path('workflows/', FormWorkflowListView.as_view(), name='form-workflow-list'),
+    path('workflows/create/', FormWorkflowCreateView.as_view(), name='form-workflow-create'),
+    path('workflows/<slug:slug>/', FormWorkflowUpdateView.as_view(), name='form-workflow-update'),
+    path('workflows/<slug:slug>/delete/', FormWorkflowSoftDeleteView.as_view(), name='form-workflow-delete'),
+    path('sections/', SectionListView.as_view(), name='section-list'),
+    path('sections/create/', SectionCreateView.as_view(), name='section-create'),
+    path('sections/<slug:slug>/', SectionUpdateView.as_view(), name='section-update'),
+    path('sections/<slug:slug>/delete/', SectionSoftDeleteView.as_view(), name='section-delete'),
+    path('forms/', FormListView.as_view(), name='form-list'),
+    path('forms/create/', FormCreateView.as_view(), name='form-create'),
+    path('forms/<slug:slug>/', FormUpdateView.as_view(), name='form-update'),
+    path('forms/<slug:slug>/delete/', FormSoftDeleteView.as_view(), name='form-delete'),
+    path('fields/', FormFieldListView.as_view(), name='form-field-list'),
+    path('fields/create/', FormFieldCreateView.as_view(), name='form-field-create'),
+    path('fields/<int:pk>/', FormFieldUpdateView.as_view(), name='form-field-update'),
+    path('fields/<int:pk>/delete/', FormFieldSoftDeleteView.as_view(), name='form-field-delete'),
+    path('select-options/', FieldSelectOptionListView.as_view(), name='field-select-option-list'),
+    path('select-options/create/', FieldSelectOptionCreateView.as_view(), name='field-select-option-create'),
+    path('select-options/<int:pk>/', FieldSelectOptionUpdateView.as_view(), name='field-select-option-update'),
+    path('select-options/<int:pk>/delete/', FieldSelectOptionSoftDeleteView.as_view(), name='field-select-option-delete'),
+    path('data/', FormDataListView.as_view(), name='form-data-list'),
+    path('data/create/', FormDataCreateView.as_view(), name='form-data-create'),
+    path('data/<int:pk>/', FormDataUpdateView.as_view(), name='form-data-update'),
+    path('data/<int:pk>/delete/', FormDataSoftDeleteView.as_view(), name='form-data-delete'),
+    path('submission/', SubmissionCreateView.as_view(), name='form-submission-create'),
+    path('submission/<slug:slug>/', SubmissionRetrieveView.as_view(), name='form-submission-detail'),
+    path('submission/module-level/<slug:module_level>/', SubmissionByModuleLevelDetailView.as_view(), name='form-submission-by-module-level'),
+    path('submit-form-data/', FormDataCreateView.as_view(), name='submit-form-data'),
+    path('form-data/', FormDataListView.as_view(), name='form-data'),
+    path("form-data/approval/", FormDataApprovalView.as_view(), name="form-data-approval"),
+    path('submission/<slug:slug>/update/', SubmissionUpdateView.as_view(), name='form-submission-update'),
+]

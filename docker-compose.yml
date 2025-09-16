@@ -1,0 +1,33 @@
+services:
+
+  nluis:
+    container_name: nluis_api
+    build: .
+    command: ['python', 'manage.py', 'runserver', '0.0.0.0:8080']
+    volumes:
+
+      - .:/app
+    ports:
+      - 8080:8080
+    environment:
+      - name=value
+    depends_on:
+      - db
+    restart: on-failure
+
+  db:
+    platform: linux/amd64
+    image: postgis/postgis:17-3.5
+    container_name: nluis_db
+    restart: on-failure
+    ports:
+      - 5549:5433
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: nluis_db
+    volumes:
+      - nluis_db_data:/var/lib/postgresql/data
+
+volumes:
+  nluis_db_data:

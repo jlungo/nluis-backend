@@ -1,0 +1,6 @@
+<p>
+    Hi <b>{{ user.username }}</b> </br>
+    Please click on the link to confirm your registration, If that doesn't work, copy and paste the following link in your browser </br>
+    http://{{ domain }}{% url 'activate' uidb64=uid token=token %}</br>
+    <b>Password: {{password}}</b>
+</p>

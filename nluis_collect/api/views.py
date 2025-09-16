@@ -1,0 +1,2533 @@
+import base64
+import io
+import json
+import os
+import shutil
+import time
+import datetime
+import traceback
+from random import randrange
+from wsgiref.util import FileWrapper
+
+#
+from django.conf import settings
+#
+from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image
+import requests
+from io import BytesIO
+from PIL import Image as PILImage
+import urllib.parse
+
+
+
+import shapefile
+from celery.result import AsyncResult
+from decouple import config
+from django.core.files import File
+from django.core.serializers import serialize
+from django.db import transaction
+from django.http import HttpResponse
+# Create your views here.
+from django.utils.encoding import smart_str
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+from rest_framework import status
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.status import HTTP_201_CREATED, HTTP_409_CONFLICT
+from rest_framework.views import APIView
+
+from libs.docs.ccro import generate_ccro
+from libs.docs.trans_sheet import generate_transaction
+from libs.fxs import save_history, val_answer, register_parcel, val_none_str, str_to_list
+from libs.shp.mobilelite import populate_mobile_data, populate_mobile_data2
+from libs.shp.ushp import read_shp
+from libs.tasks import download_shp, qn_download_shp
+from nluis.settings import DOCS_OUTPUT
+from nluis_collect.models import TemporaryFile, Form, Category, FormField, FormAnswer, FormAnswerQuestionnaire
+from nluis_localities.models import Locality
+from nluis_projects.models import *
+from nluis_ccro.models import *
+from nluis_setups.models import LandUse, OccupancyType, PartyRole, DocumentType
+from django.contrib.auth.models import User, Group
+from rest_framework.pagination import LimitOffsetPagination
+from nluis_authorization.models import AppUser
+from django.db.models import Max
+
+
+class ConfigUserView(APIView):
+
+    def get(self, request, **kwargs):
+        try:
+            device_id = kwargs['device_id']
+
+            user = TeamMember.objects.get(user=request.user)
+            print(user)
+            if user.device_id is None:
+                user.device_id = device_id
+                user.save(update_fields=['device_id'])
+            # else:
+            #     try:
+            #         user = AppUser.objects.get(user=request.user, device_id=device_id)
+            #     except Exception as e:
+            #         return Response({
+            #             'status': 0,
+            #             'message': 'Kifaa hiki hakiendani na Mtumiaji'
+            #         })
+
+            if user is None:
+                return Response({
+                    'status': 0,
+                    'message': 'Invalid User'
+                })
+
+            questionnaire = []
+            lst_ids = []
+            for i in str_to_list(user.dodoso_categories):
+                lst_ids.append(i)
+
+            for q in Category.objects.filter(project_type=user.project.project_type, id__in=lst_ids).order_by(
+                    'order_no'):
+                contents = []
+
+                for c in Form.objects.filter(category=q):
+                    contents.append({
+                        'id': c.id,
+                        'name': c.name,
+                        'question': c.questions().values('id', 'form_field', 'data_type', 'options', 'required',
+                                                         'parent', 'parent_value', 'hint', 'error_message', 'flag'),
+                        'flag': c.flag,
+                    })
+
+                print(q.flag)
+
+                questionnaire.append({
+                    'id': q.id,
+                    'name': q.name,
+                    'contents': contents,
+                    'tag': q.flag,
+                    'category': 'question'
+                })
+
+                sub_qn = Category.objects.filter(parent=q)
+                if sub_qn.count() > 0:
+                    contents = []
+                    sb_q = sub_qn.first()
+
+                    for c in Form.objects.filter(category=sb_q):
+                        contents.append({
+                            'id': c.id,
+                            'name': c.name,
+                            'question': c.questions().values('id', 'form_field', 'data_type', 'options', 'required',
+                                                             'parent', 'parent_value', 'hint', 'error_message', 'flag'),
+                            'flag': c.flag,
+                        })
+
+                    questionnaire.append({
+                        'id': sb_q.id,
+                        'name': sb_q.name,
+                        'contents': contents,
+                        'tag': sb_q.tag,
+                        'category': 'sub_question'
+                    })
+
+            villages = []
+
+            for v in user.project.localites.all():
+                hamlets = []
+                for h in Locality.objects.filter(parent=v, level_id=7):
+                    count = FormAnswer.objects.filter(para_surveyor=user, locality=h).exclude(claim_no__contains='_') \
+                        .order_by('claim_no').distinct('claim_no').count()
+                    hamlets.append({
+                        'id': h.id,
+                        'name': h.name,
+                        'count': count
+                    })
+                villages.append({
+                    'id': v.id,
+                    'name': v.name,
+                    'hamlets': hamlets
+                })
+
+            return Response({
+                'status': 1,
+                'user': {
+                    'id': user.id,
+                    'name': f'{user.user.first_name} {user.user.last_name}'
+                },
+                'project': {
+                    'id': user.project_id,
+                    'name': user.project.name,
+                    'output': {
+                        'id': user.project.project_type.id,
+                        'code': user.project.project_type.code,
+                        'name': user.project.project_type.name,
+                    },
+                    'location': user.locality.name if user.locality is not None else 'Not Assigned'
+                },
+                'questionnaire': questionnaire,
+                'village': villages,
+                'land_use': LandUse.objects.order_by('order_no').values('id', 'swahili', 'name'),
+                'occupancy': OccupancyType.objects.values('id', 'swahili', 'name', 'quantity'),
+                'boundary': json.loads(serialize('geojson', ProjectLayer.objects.filter(project=user.project)))
+            })
+
+        except Exception as e:
+            print(e)
+            traceback.print_exc()
+            return Response({
+                'status': 0,
+                'message': str(e)
+            })
+
+
+class CreateMobileDataView(APIView):
+    def post(self, request):
+        status = 0
+        try:
+            fh = TemporaryFile(description='Mobile Data', file=request.FILES.get('zipped'))
+            fh.save()
+
+            # response = populate_mobile_data.delay(request.user.id, fh.file.path)
+            # status = 1  # response['status']
+            # message = ''  # response['message']
+            response = populate_mobile_data(request.user.id, fh.file.path)
+            status = response['status']
+            message = response['message']
+
+        except Exception as e:
+            message = str(e)
+            print(e)
+        return Response({
+            'status': status,
+            'message': message
+        })
+
+
+class CreateMobileDataView2(APIView):
+    def post(self, request, **kwargs):
+        status = 0
+        try:
+            fh = TemporaryFile(description='Mobile Data', file=request.FILES.get('zipped'))
+            fh.save()
+
+            team_member = TeamMember.objects.get(user=User.objects.get(id=request.user.id))
+            extra = json.loads(request.data['extra'])
+            project_id = int(extra['project_id'])
+            response = populate_mobile_data2(team_member.id, fh.file.path, project_id)
+            status = response['status']
+            message = response['message']
+
+
+        except Exception as e:
+            message = str(e)
+            print(e)
+        return Response({
+            'status': status,
+            'message': message
+        })
+
+
+class ListDraftDataView(APIView):
+    def get(self, request, **kwargs):
+        status = 0
+        message = ''
+        out_path = ''
+        project_id = kwargs['project_id']
+        locality_id = kwargs['locality_id']
+        flag = kwargs['flag']
+
+        subw = Locality.objects.get(id=locality_id)
+        proj = Project.objects.get(id=project_id)
+
+        print(flag)
+        data = []
+
+        for categories in Category.objects.filter(project_type=proj.project_type).filter(flag=flag):
+            categories_questions = []
+            for qn in FormField.objects.filter(form__category=categories):
+                categories_questions.append({
+                    'id': qn.id,
+                    'name': qn.form_field
+                })
+
+            data.append(categories_questions)
+
+        answers = []
+
+        for d in FormAnswer.objects.filter(form_field__form__category__flag=flag,
+                                           response__istartswith='polygon', stage='draft',
+                                           project=proj, locality__parent=subw).order_by('claim_no').distinct(
+            'claim_no'):
+            ans = []
+
+            for qn in data[0]:
+                try:
+                    jibu = FormAnswer.objects.get(claim_no=d.claim_no, form_field_id=qn['id'])
+                    resp = jibu.response
+                    if resp.lower().startswith('polygon'):
+                        resp = 'Spatial Unit'
+                    ans.append({
+                        'id': jibu.id,
+                        'jibu': resp
+                    })
+                except Exception as e:
+                    print(e)
+                    pass
+                    ans.append({
+                        'id': 0,
+                        'jibu': ''
+                    })
+            answers.append(ans)
+
+        return Response({
+            'questions': data[0],
+            'answers': answers
+        })
+
+
+class CCROUploadSHP(APIView):
+    # @transaction.atomic
+    def post(self, request):
+        print(request.data)
+        status = 0
+        ref_id = 0
+        message = ''
+        success = []
+        failure = []
+
+        try:
+            extra = json.loads(request.data['extra'])
+            project_id = int(extra['project_id'])
+            task_id = int(extra['task_id'])
+            screen_code = str(extra['screen_code'])
+
+            file = TemporaryFile(file=request.FILES.get('zipped'), description='GIS Approval')
+            file.save()
+            for c in read_shp(file.file.path):
+
+                claim_no = c.get('CLAIM_NO')
+
+                try:
+                    hamlet_id = int(FormAnswer.objects.get(claim_no=claim_no,form_field__data_type='hamlet').response)
+                    hamlet = Locality.objects.get(id=hamlet_id)
+                    parent = Locality.objects.get(name__iexact=c.get('Kijiji'), level_id=1)
+
+                    try:
+                        occupancy = OccupancyType.objects.get(name__iexact=c.get('Umiliki'))
+                    except Exception as e:
+                        occupancy = None
+
+                    try:
+                        use = LandUse.objects.get(name__iexact=c.get('Matumizi_y'))
+                    except Exception as e:
+                        use = None
+
+                    parcel = Parcel(
+                        project=Project.objects.get(id=project_id),
+                        claim_no=claim_no,
+                        claim_date=c.get('DATE_'),
+                        current_use=use,
+                        # proposed_use=proposed_use,
+                        occupancy_type=occupancy,
+                        # vac_1=vac_1,
+                        # vac_2=vac_2,
+                        locality=parent,
+                        hamlet=hamlet, # Locality.objects.get(name__iexact=c.get('Kitongoji'), level_id=7, parent=parent),
+                        topology=c.get('Topolijia'),
+                        north=c.get('Kaskazini'),
+                        south=c.get('Kusini'),
+                        east=c.get('Mashariki'),
+                        west=c.get('Magharibi'),
+                        status='occupied',
+                        stage='gis_approval',
+                        geom=c.geom.geojson,
+                        paras_comment=c.get('Toa_maoni_')
+                    )
+
+                    parcel.save()
+
+                    # address = val_answer(claim_no, 17)
+                    # occupation = val_answer(claim_no, 17)
+
+                    for ans in FormAnswer.objects.filter(project_id=project_id,
+                                                         claim_no__startswith=f'{claim_no}_m').order_by(
+                        'claim_no').distinct('claim_no'):
+                        try:
+
+                            middle_name = ''
+                            last_name = ''
+                            jina = val_answer(ans.claim_no, 17)
+
+                            print(f'Jina lake ni ..............{jina}')
+
+                            first_name = jina
+                            name = str(jina).split(' ')
+
+                            if len(name) > 1:
+                                first_name = name[0]
+                                middle_name = name[1]
+                                try:
+                                    last_name = name[2]
+                                except Exception as e:
+                                    pass
+                            if len(name) == 1:
+                                first_name = name[0]
+                                middle_name = ''
+                                last_name = name[1]
+
+                            gender = val_answer(ans.claim_no, 18)
+                            # dob = val_answer(ans.claim_no, 19)
+                            try:
+                                picture = FormAnswer.objects.get(claim_no=ans.claim_no,
+                                                                 form_field_id=27).image  # val_answer(ans.claim_no, )
+                            except Exception as e:
+                                picture = None
+
+                            citizen = val_answer(ans.claim_no, 24)
+                            id_type = val_answer(ans.claim_no, 21)
+                            id_no = val_answer(ans.claim_no, 22)
+                            dob = val_answer(ans.claim_no, 19)
+                            # id_pic = val_answer(claim_no, 17)
+                            role = '',
+                            acquire = val_answer(ans.claim_no, 134)
+                            marital = val_answer(ans.claim_no, 23)
+                            disability = val_answer(ans.claim_no, 20)
+                            phone = val_answer(ans.claim_no, 25)
+                            email = val_answer(ans.claim_no, 26)
+
+                            party = Party(
+                                first_name=first_name,
+                                middle_name=middle_name,
+                                last_name=last_name,
+                                gender=gender,
+                                picture=picture,
+                                citizen=citizen,
+                                id_type=id_type,
+                                id_no=id_no,
+                                dob=dob if len(str(dob)) > 5 else None,
+                                # id_pic=id_pi,
+                                role=PartyRole.objects.first() if 'mmiliki' in ans.claim_no else PartyRole.objects.last(),
+                                acquire=acquire,
+                                marital=marital,
+                                disability=disability,
+                                phone=phone,
+                                email=email,
+                                address='',
+                                occupation=''
+                            )
+
+                            party.save()
+
+                            allocation = Allocation(
+                                parcel=parcel,
+                                party=party
+                            )
+                            allocation.save()
+
+                        except Exception as e:
+                            traceback.print_exc()
+
+                    remark = Remark(
+                        action=parcel.stage,
+                        description='GIS Approval'
+                    )
+                    remark.save()
+                    parcel.remarks.add(remark)
+                    parcel.save()
+
+                    for d in FormAnswer.objects.filter(claim_no=claim_no):
+                        d.stage = parcel.stage
+                        d.save(update_fields=['stage'])
+
+                    success.append(f'{claim_no}')
+                    save_history(parcel.project_id, 'Create', f'{parcel.id} was created', task_id,
+                                 screen_code)
+                except Exception as e:
+                    failure.append({'claim_no': f'{claim_no}', 'reason': str(e)})
+                    save_history(project_id, 'Not Created', f'{claim_no} - {str(e)}', task_id,
+                                 screen_code)
+
+        except Exception as e:
+            message = str(e)
+            # transaction.set_rollback(True)
+            print(e)
+        return Response({
+            'status': status,
+            'message': message,
+            'response': {'success': success, 'failure': failure}
+        })
+
+
+class CCRODownloadSHPsssss(APIView):
+
+    def post(self, request):
+        status = 0
+        message = ''
+        project_id = request.data['project_id']
+        village_id = request.data['village_id']
+
+        lst_claims = Parcel.objects.filter(locality=village_id).values_list('claim_no')
+
+        qs_answer = FormAnswer.objects.exclude(claim_no__in=lst_claims).filter(
+           rform_field__form__category__flag='dodoso',
+            response__istartswith='polygon',
+            locality__parent_id=village_id).order_by(
+            'claim_no').distinct('claim_no')
+
+        task = download_shp.delay(village_id, project_id)
+        locality_name = Locality.objects.get(id=village_id).name
+        return Response({
+            'task_id': task.id,
+            'task_state': task.state,
+            'task_ready': task.ready(),
+            'locality_name': locality_name,
+            'count': qs_answer.count()
+        })
+
+    def get(self, request):
+
+        task_id = request.GET['task_id']
+        task = AsyncResult(task_id)
+        if task.state == 'FAILURE' or task.state == 'PENDING':
+            response = {
+                'task_id': task_id,
+                'state': task.state,
+                'progression': "None",
+                'info': str(task.info)
+            }
+        else:
+            current = task.info.get('current', 0)
+            total = task.info.get('total', 1)
+            progression = (int(current) / int(total)) * 100  # to display a percentage of progress of the task
+            response = {
+                'task_id': task_id,
+                'state': task.state,
+                'progression': f'{progression:,.2f}',
+                'info': "None"
+            }
+        return Response(response, status=200)
+
+
+
+
+
+
+
+class CCRODownloadSHP(APIView):
+
+    def post(self, request):
+        status = 0
+        message = ''
+        project_id = request.data['project_id']
+        village_id = request.data['village_id']
+
+        lst_claims = Parcel.objects.filter(locality=village_id).values_list('claim_no')
+
+        qs_answer = FormAnswer.objects.exclude(claim_no__in=lst_claims).filter(
+            form_field__form__category__flag='dodoso',
+            response__istartswith='polygon',
+            locality__parent_id=village_id).order_by(
+            'claim_no').distinct('claim_no')
+
+        task = download_shp.delay(village_id, project_id)
+        locality_name = Locality.objects.get(id=village_id).name
+        return Response({
+            'task_id': task.id,
+            'task_state': task.state,
+            'task_ready': task.ready(),
+            'locality_name': locality_name,
+            'count': qs_answer.count()
+        })
+
+    def get(self, request):
+
+        task_id = request.GET['task_id']
+        task = AsyncResult(task_id)
+        if task.state == 'FAILURE' or task.state == 'PENDING':
+            response = {
+                'task_id': task_id,
+                'state': task.state,
+                'progression': "None",
+                'info': str(task.info)
+            }
+        else:
+            current = task.info.get('current', 0)
+            total = task.info.get('total', 1)
+            progression = (int(current) / int(total)) * 100  # to display a percentage of progress of the task
+            response = {
+                'task_id': task_id,
+                'state': task.state,
+                'progression': f'{progression:,.2f}',
+                'info': "None"
+            }
+        return Response(response, status=200)
+
+
+
+
+
+#grouping by kitongoji
+def download_excel(request):
+    # Create a new Workbook
+    wb = Workbook()
+    # Select the active sheet
+    sheet = wb.active
+
+    # Add data to the sheet
+    data = [
+        ['CLAIM NO', 'PICHA', 'WAMILIKI', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 'KITONGOJI', 'KASKAZINI',
+         'KUSINI', 'MASHARIKI', 'MAGHARIBI']
+    ]
+    village = Locality.objects.get(id=request.GET['village_id'])
+
+    # Helper function to insert multiple images to cell
+    def insert_multiple_images_to_cell(sheet, image_urls, cell):
+        try:
+            if not image_urls:
+                return False
+
+            # Calculate starting position for images
+            col_letter = cell[0]
+            row_num = int(cell[1:])
+
+            # Insert each image with offset
+            for index, image_url in enumerate(image_urls):
+                if not image_url:
+                    continue
+
+                # Ensure URL has proper scheme
+                if not image_url.startswith('http'):
+                    image_url = f"{settings.BASE_URL.rstrip('/')}/media/{image_url.lstrip('/')}"
+
+                print(f"Attempting to fetch image {index + 1} from: {image_url}")
+
+                # Download image from URL
+                response = requests.get(image_url, verify=False, timeout=10)
+                if response.status_code == 200:
+                    # Convert to PIL Image and resize
+                    img = PILImage.open(BytesIO(response.content))
+                    # Resize image to smaller dimensions for multiple images (e.g. 80x80 pixels)
+                    img.thumbnail((80, 80))
+
+                    # Save resized image to BytesIO
+                    img_byte_arr = BytesIO()
+                    img.save(img_byte_arr, format=img.format if img.format else 'PNG')
+                    img_byte_arr.seek(0)
+
+                    # Create openpyxl image
+                    excel_image = Image(img_byte_arr)
+
+                    # Calculate position for this image (stacked vertically)
+                    image_cell = f'{col_letter}{row_num + index}'
+
+                    # Add image to worksheet
+                    sheet.add_image(excel_image, image_cell)
+
+                    # Adjust row height to accommodate image
+                    sheet.row_dimensions[row_num + index].height = 60
+
+                else:
+                    print(f"Failed to fetch image {index + 1}. Status code: {response.status_code}")
+
+            return True
+        except Exception as e:
+            print(f"Error adding images: {str(e)}")
+            return False
+
+    # Collect all parcel data first for sorting
+    parcel_data = []
+
+    for p in Parcel.objects.filter(locality=village, stage='gis_approval').order_by('claim_no'):
+        try:
+            majina = ''
+            for j in p.parties():
+                majina = majina + j + ","
+            majina = majina + ","
+            majina = majina.replace(",,", "")
+
+            simu = ''
+            for j in p.phones():
+                simu = simu + j + ","
+            simu = simu + ","
+            simu = simu.replace(",,", "")
+
+            # Get all party pictures
+            party_pictures = []
+            try:
+                for allocation in p.allocation_set.all():
+                    if allocation.party and allocation.party.picture:
+                        image_path = allocation.party.picture.name
+                        if image_path:  # Only add if path is not empty
+                            party_pictures.append(image_path)
+            except Exception as e:
+                print(f"Error getting party pictures for parcel {p.id}: {str(e)}")
+                party_pictures = []
+
+            use = ''
+            if p.current_use is not None:
+                use = p.current_use.name
+            occupancy = ''
+            if p.occupancy_type is not None:
+                occupancy = p.occupancy_type.name
+
+            parcel_data.append({
+                'wamiliki': majina.upper(),
+                'data': [p.claim_no, party_pictures, majina.upper(), simu, use, occupancy, p.area(), p.locality.name,
+                         p.hamlet.name, str(p.north).replace('--', "'"),
+                         str(p.south).replace('--', "'"), str(p.east).replace('--', "'"), str(p.west).replace('--', "'")],
+                'pictures': party_pictures
+            })
+        except Exception as e:
+            print(f"Error processing parcel {p.id}: {str(e)}")
+            continue
+
+    # Sort parcel data by KITONGOJI (hamlet) first, then by wamiliki (owners) in ascending order
+    parcel_data.sort(key=lambda x: (x['data'][8], x['wamiliki']))  # Index 8 is KITONGOJI (hamlet.name)
+
+    # Add sorted data to the main data list
+    for parcel in parcel_data:
+        data.append(parcel['data'])
+
+    # Add data to the sheet
+    for row_index, row_data in enumerate(data, start=1):
+        for col_index, cell_data in enumerate(row_data, start=1):
+            col_letter = get_column_letter(col_index)
+            cell = f'{col_letter}{row_index}'
+
+            # Handle image insertion for party pictures (column B)
+            if col_index == 2 and row_index > 1:
+                try:
+                    # Clear the cell content
+                    sheet[cell] = ''
+                    # Insert multiple images if available
+                    if isinstance(cell_data, list) and cell_data:
+                        insert_multiple_images_to_cell(sheet, cell_data, cell)
+                except Exception as e:
+                    print(f"Error inserting images for row {row_index}: {str(e)}")
+                    sheet[cell] = 'Error loading images'
+            else:
+                # Ensure we never assign lists to cells
+                if isinstance(cell_data, list):
+                    sheet[cell] = str(cell_data)  # Convert list to string
+                else:
+                    sheet[cell] = cell_data
+
+    # Adjust column width for image column (column B)
+    sheet.column_dimensions['B'].width = 20
+
+    # Set the response headers for Excel file download
+    response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    response['Content-Disposition'] = 'attachment; filename={}'.format(smart_str(f'{village.name}.xlsx'))
+
+    # Save the Workbook to the response
+    wb.save(response)
+
+    return response
+
+
+
+def download_excelzzz(request):
+    # Create a new Workbook
+    wb = Workbook()
+    # Select the active sheet
+    sheet = wb.active
+
+    # Add data to the sheet
+    data = [
+        ['CLAIM NO', 'PICHA', 'WAMILIKI', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 'KITONGOJI', 'KASKAZINI',
+         'KUSINI', 'MASHARIKI', 'MAGHARIBI']
+    ]
+    village = Locality.objects.get(id=request.GET['village_id'])
+
+    # Helper function to insert multiple images to cell
+    def insert_multiple_images_to_cell(sheet, image_urls, cell):
+        try:
+            if not image_urls:
+                return False
+            
+            # Calculate starting position for images
+            col_letter = cell[0]
+            row_num = int(cell[1:])
+            
+            # Insert each image with offset
+            for index, image_url in enumerate(image_urls):
+                if not image_url:
+                    continue
+                    
+                # Ensure URL has proper scheme
+                if not image_url.startswith('http'):
+                    image_url = f"{settings.BASE_URL.rstrip('/')}/media/{image_url.lstrip('/')}"
+                
+                print(f"Attempting to fetch image {index + 1} from: {image_url}")
+
+                # Download image from URL
+                response = requests.get(image_url, verify=False, timeout=10)
+                if response.status_code == 200:
+                    # Convert to PIL Image and resize
+                    img = PILImage.open(BytesIO(response.content))
+                    # Resize image to smaller dimensions for multiple images (e.g. 80x80 pixels)
+                    img.thumbnail((80, 80))
+                    
+                    # Save resized image to BytesIO
+                    img_byte_arr = BytesIO()
+                    img.save(img_byte_arr, format=img.format if img.format else 'PNG')
+                    img_byte_arr.seek(0)
+
+                    # Create openpyxl image
+                    excel_image = Image(img_byte_arr)
+                    
+                    # Calculate position for this image (stacked vertically)
+                    image_cell = f'{col_letter}{row_num + index}'
+                    
+                    # Add image to worksheet
+                    sheet.add_image(excel_image, image_cell)
+                    
+                    # Adjust row height to accommodate image
+                    sheet.row_dimensions[row_num + index].height = 60
+                    
+                else:
+                    print(f"Failed to fetch image {index + 1}. Status code: {response.status_code}")
+            
+            return True
+        except Exception as e:
+            print(f"Error adding images: {str(e)}")
+            return False
+
+    # Collect all parcel data first for sorting
+    parcel_data = []
+    
+    for p in Parcel.objects.filter(locality=village, stage='gis_approval').order_by('claim_no'):
+        try:
+            majina = ''
+            for j in p.parties():
+                majina = majina + j + ","
+            majina = majina + ","
+            majina = majina.replace(",,", "")
+
+            simu = ''
+            for j in p.phones():
+                simu = simu + j + ","
+            simu = simu + ","
+            simu = simu.replace(",,", "")
+
+            # Get all party pictures
+            party_pictures = []
+            try:
+                for allocation in p.allocation_set.all():
+                    if allocation.party and allocation.party.picture:
+                        image_path = allocation.party.picture.name
+                        if image_path:  # Only add if path is not empty
+                            party_pictures.append(image_path)
+            except Exception as e:
+                print(f"Error getting party pictures for parcel {p.id}: {str(e)}")
+                party_pictures = []
+
+            use = ''
+            if p.current_use is not None:
+                use = p.current_use.name
+            occupancy = ''
+            if p.occupancy_type is not None:
+                occupancy = p.occupancy_type.name
+
+            parcel_data.append({
+                'wamiliki': majina.upper(),
+                'data': [p.claim_no, party_pictures, majina.upper(), simu, use, occupancy, p.area(), p.locality.name,
+                         p.hamlet.name, str(p.north).replace('--', "'"),
+                         str(p.south).replace('--', "'"), str(p.east).replace('--', "'"), str(p.west).replace('--', "'")],
+                'pictures': party_pictures
+            })
+        except Exception as e:
+            print(f"Error processing parcel {p.id}: {str(e)}")
+            continue
+
+    # Sort parcel data by wamiliki (owners) in ascending order
+    parcel_data.sort(key=lambda x: x['wamiliki'])
+
+    # Add sorted data to the main data list
+    for parcel in parcel_data:
+        data.append(parcel['data'])
+
+    # Add data to the sheet
+    for row_index, row_data in enumerate(data, start=1):
+        for col_index, cell_data in enumerate(row_data, start=1):
+            col_letter = get_column_letter(col_index)
+            cell = f'{col_letter}{row_index}'
+            
+            # Handle image insertion for party pictures (column B)
+            if col_index == 2 and row_index > 1:
+                try:
+                    # Clear the cell content
+                    sheet[cell] = ''
+                    # Insert multiple images if available
+                    if isinstance(cell_data, list) and cell_data:
+                        insert_multiple_images_to_cell(sheet, cell_data, cell)
+                except Exception as e:
+                    print(f"Error inserting images for row {row_index}: {str(e)}")
+                    sheet[cell] = 'Error loading images'
+            else:
+                # Ensure we never assign lists to cells
+                if isinstance(cell_data, list):
+                    sheet[cell] = str(cell_data)  # Convert list to string
+                else:
+                    sheet[cell] = cell_data
+
+    # Adjust column width for image column (column B)
+    sheet.column_dimensions['B'].width = 20
+
+    # Set the response headers for Excel file download
+    response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    response['Content-Disposition'] = 'attachment; filename={}'.format(smart_str(f'{village.name}.xlsx'))
+
+    # Save the Workbook to the response
+    wb.save(response)
+
+    return response
+
+
+
+
+
+
+
+def download_excelwrong(request):
+    # Create a new Workbook
+    wb = Workbook()
+    # Select the active sheet
+    sheet = wb.active
+
+    # Add data to the sheet
+    data = [
+        ['CLAIM NO', 'PICHA', 'WAMILIKI', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 'KITONGOJI', 'KASKAZINI',
+         'KUSINI', 'MASHARIKI', 'MAGHARIBI']
+    ]
+    village = Locality.objects.get(id=request.GET['village_id'])
+
+    # Helper function to insert multiple images to cell
+    def insert_multiple_images_to_cell(sheet, image_urls, cell):
+        try:
+            if not image_urls:
+                return False
+            
+            # Calculate starting position for images
+            col_letter = cell[0]
+            row_num = int(cell[1:])
+            
+            # Insert each image with offset
+            for index, image_url in enumerate(image_urls):
+                if not image_url:
+                    continue
+                    
+                # Ensure URL has proper scheme
+                if not image_url.startswith('http'):
+                    image_url = f"{settings.BASE_URL.rstrip('/')}/media/{image_url.lstrip('/')}"
+                
+                print(f"Attempting to fetch image {index + 1} from: {image_url}")
+
+                # Download image from URL
+                response = requests.get(image_url, verify=False)
+                if response.status_code == 200:
+                    # Convert to PIL Image and resize
+                    img = PILImage.open(BytesIO(response.content))
+                    # Resize image to smaller dimensions for multiple images (e.g. 80x80 pixels)
+                    img.thumbnail((80, 80))
+                    
+                    # Save resized image to BytesIO
+                    img_byte_arr = BytesIO()
+                    img.save(img_byte_arr, format=img.format if img.format else 'PNG')
+                    img_byte_arr.seek(0)
+
+                    # Create openpyxl image
+                    excel_image = Image(img_byte_arr)
+                    
+                    # Calculate position for this image (stacked vertically)
+                    image_cell = f'{col_letter}{row_num + index}'
+                    
+                    # Add image to worksheet
+                    sheet.add_image(excel_image, image_cell)
+                    
+                    # Adjust row height to accommodate image
+                    sheet.row_dimensions[row_num + index].height = 60
+                    
+                else:
+                    print(f"Failed to fetch image {index + 1}. Status code: {response.status_code}")
+            
+            return True
+        except Exception as e:
+            print(f"Error adding images: {str(e)}")
+            return False
+
+    # Collect all parcel data first for sorting
+    parcel_data = []
+    
+    for p in Parcel.objects.filter(locality=village, stage='gis_approval').order_by('claim_no'):
+        majina = ''
+        for j in p.parties():
+            majina = majina + j + ","
+        majina = majina + ","
+        majina = majina.replace(",,", "")
+
+        simu = ''
+        for j in p.phones():
+            simu = simu + j + ","
+        simu = simu + ","
+        simu = simu.replace(",,", "")
+
+        # Get all party pictures
+        party_pictures = []
+        try:
+            for allocation in p.allocation_set.all():
+                if allocation.party and allocation.party.picture:
+                    image_path = allocation.party.picture.name
+                    party_pictures.append(image_path)
+        except Exception as e:
+            print(f"Error getting party pictures for parcel {p.id}: {str(e)}")
+
+        use = ''
+        if p.current_use is not None:
+            use = p.current_use.name
+        occupancy = ''
+        if p.occupancy_type is not None:
+            occupancy = p.occupancy_type.name
+
+        parcel_data.append({
+            'wamiliki': majina.upper(),
+            'data': [p.claim_no, party_pictures, majina.upper(), simu, use, occupancy, p.area(), p.locality.name,
+                     p.hamlet.name, str(p.north).replace('--', "'"),
+                     str(p.south).replace('--', "'"), str(p.east).replace('--', "'"), str(p.west).replace('--', "'")],
+            'pictures': party_pictures
+        })
+
+    # Sort parcel data by wamiliki (owners) in ascending order
+    parcel_data.sort(key=lambda x: x['wamiliki'])
+
+    # Add sorted data to the main data list
+    for parcel in parcel_data:
+        data.append(parcel['data'])
+
+    # Add data to the sheet
+    for row_index, row_data in enumerate(data, start=1):
+        for col_index, cell_data in enumerate(row_data, start=1):
+            col_letter = get_column_letter(col_index)
+            cell = f'{col_letter}{row_index}'
+            
+            # Handle image insertion for party pictures (column B)
+            if col_index == 2 and row_index > 1 and cell_data:
+                # Clear the cell content
+                sheet[cell] = ''
+                # Insert multiple images if available
+                if isinstance(cell_data, list) and cell_data:
+                    insert_multiple_images_to_cell(sheet, cell_data, cell)
+            else:
+                sheet[cell] = cell_data
+
+    # Adjust column width for image column (column B)
+    sheet.column_dimensions['B'].width = 20
+
+    # Set the response headers for Excel file download
+    response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    response['Content-Disposition'] = 'attachment; filename={}'.format(smart_str(f'{village.name}.xlsx'))
+
+    # Save the Workbook to the response
+    wb.save(response)
+
+    return response
+
+
+
+
+
+#OLD VERSION
+def download_excelss(request):
+    # Create a new Workbook
+    wb = Workbook()
+    # Select the active sheet
+    sheet = wb.active
+
+    # Add data to the sheet
+    data = [
+        ['CLAIM NO', 'WAMILIKI', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 'KITONGOJI', 'KASKAZINI',
+         'KUSINI',
+         'MASHARIKI', 'MAGHARIBI']
+    ]
+    village = Locality.objects.get(id=request.GET['village_id'])
+    for p in Parcel.objects.filter(locality=village, stage='gis_approval').order_by('claim_no'):
+        majina = ''
+        for j in p.parties():
+            majina = majina + j + ","
+        majina = majina + ","
+        majina = majina.replace(",,", "")
+
+        simu = ''
+        for j in p.phones():
+            simu = simu + j + ","
+        simu = simu + ","
+        simu = simu.replace(",,", "")
+        use = ''
+        if p.current_use is not None:
+            use = p.current_use.name
+        occupancy = ''
+        if p.occupancy_type is not None:
+            occupancy = p.occupancy_type.name
+
+        data.append(
+            [p.claim_no, majina.upper(), simu, use, occupancy, p.area(), p.locality.name,
+             p.hamlet.name, str(p.north).replace('--', "'"),
+             str(p.south).replace('--', "'"), str(p.east).replace('--', "'"), str(p.west).replace('--', "'")])
+
+    # Add data to the sheet
+    for row_index, row_data in enumerate(data, start=1):
+        for col_index, cell_data in enumerate(row_data, start=1):
+            col_letter = get_column_letter(col_index)
+            sheet['{}{}'.format(col_letter, row_index)] = cell_data
+
+    # Set the response headers for Excel file download
+    response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    response['Content-Disposition'] = 'attachment; filename={}'.format(smart_str(f'{village.name}.xlsx'))
+
+    # Save the Workbook to the response
+    wb.save(response)
+
+    return response
+
+
+
+# restored  version of download  parcel excel
+def download_parcel_excelSS(request, **kwargs):
+    # Create a new Workbook
+    wb = Workbook()
+    # Select the active sheet
+    sheet = wb.active
+
+    stage = kwargs['stage']
+
+    # Add data to the sheet
+    if stage == 'rejected':
+        data = [
+            ['CLAIM NO', 'WAMILIKI', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 'KITONGOJI', 'KASKAZINI',
+             'KUSINI', 'MASHARIKI', 'MAGHARIBI', 'REASON']
+        ]
+    else:
+        data = [
+            ['CLAIM NO', 'USAJILI NO.', 'WAMILIKI', 'JINSIA', 'ULEMAVU', 'DOB', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 'KITONGOJI',
+             'KASKAZINI', 'KUSINI', 'MASHARIKI', 'MAGHARIBI', 'NAMBA KITAMBULISHO', 'HALI YA NDOA']
+        ]
+    village = Locality.objects.get(id=request.GET['village_id'])
+
+    for p in Parcel.objects.filter(locality=village, stage=stage).order_by('claim_no'):
+        majina = ''
+        for j in p.parties():
+            majina = majina + j + ","
+        majina = majina + ","
+        majina = majina.replace(",,", "")
+
+        simu = ''
+        for j in p.phones():
+            simu = simu + j + ","
+        simu = simu + ","
+        simu = simu.replace(",,", "")
+
+        sex = ''
+        for j in p.jinsi():
+            sex = sex + j + ","
+        sex = sex + ","
+        sex = sex.replace(",,", "")
+
+        tarehe = ''
+        for j in p.kuzaliwa():
+            tarehe = tarehe + str(j) + ","
+        tarehe = tarehe + ","
+        tarehe = tarehe.replace(",,", "")
+
+        nambaid = ''
+        for j in p.idnamba():
+            nambaid = nambaid + j + ","
+        nambaid = nambaid + ","
+        nambaid = nambaid.replace(",,", "")
+
+        hali = ''
+        for j in p.ulemavu():
+            hali = hali + j + ","
+        hali = hali + ","
+        hali = hali.replace(",,", "")
+
+        ndoa = ''
+        for j in p.ndoa():
+             ndoa = ndoa + j + ","
+        ndoa = ndoa + ","
+        ndoa = ndoa.replace(",,", "")
+
+        use = ''
+        if p.current_use is not None:
+            use = p.current_use.name
+        occupancy = ''
+        if p.occupancy_type is not None:
+            occupancy = p.occupancy_type.name
+
+        if stage == 'rejected':
+            remarks = ''
+            for r in p.remarks.all():
+                remarks = remarks + r.description + ","
+            remarks = remarks + ","
+            remarks = remarks.replace(",,", "")
+            data.append(
+                [p.claim_no, majina.upper(), simu, use, occupancy, p.area(), p.locality.name,
+                 p.hamlet.name, str(p.north).replace('--', "'"),
+                 str(p.south).replace('--', "'"), str(p.east).replace('--', "'"), str(p.west).replace('--', "'"),
+                 remarks])
+        else:
+            data.append(
+                [p.claim_no, p.registration_no, majina.upper(), sex, hali, tarehe, simu, use, occupancy, p.area(), p.locality.name,
+                 p.hamlet.name, str(p.north).replace('--', "'"),
+                 str(p.south).replace('--', "'"), str(p.east).replace('--', "'"), str(p.west).replace('--', "'"), nambaid, ndoa])
+
+    # Add data to the sheet
+    for row_index, row_data in enumerate(data, start=1):
+        for col_index, cell_data in enumerate(row_data, start=1):
+            col_letter = get_column_letter(col_index)
+            sheet['{}{}'.format(col_letter, row_index)] = cell_data
+
+    # Set the response headers for Excel file download
+    response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    response['Content-Disposition'] = 'attachment; filename={}'.format(smart_str(f'{village.name}.xlsx'))
+
+    # Save the Workbook to the response
+    wb.save(response)
+
+    return response
+
+
+#THIS INCLUDES SORTED NAMES AND PICTURES
+
+def download_parcel_excel(request, **kwargs):
+    # Create a new Workbook
+    wb = Workbook()
+    # Select the active sheet
+    sheet = wb.active
+
+    stage = kwargs['stage']
+
+    # Add data to the sheet
+    if stage == 'rejected':
+        data = [
+            ['CLAIM NO', 'WAMILIKI', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 'KITONGOJI', 'KASKAZINI',
+             'KUSINI', 'MASHARIKI', 'MAGHARIBI', 'REASON']
+        ]
+    else:
+        data = [
+            ['CLAIM NO', 'USAJILI NO.', 'WAMILIKI', 'JINSIA', 'ULEMAVU', 'DOB', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 'KITONGOJI',
+             'KASKAZINI', 'KUSINI', 'MASHARIKI', 'MAGHARIBI', 'PICHA', 'NAMBA KITAMBULISHO', 'HALI YA NDOA']
+        ]
+    village = Locality.objects.get(id=request.GET['village_id'])
+
+    # Helper function to insert image to cell
+    def insert_image_to_cell(sheet, image_url, cell):
+        try:
+            # Validate URL
+            if not image_url:
+                return False
+                
+            # Ensure URL has proper scheme
+            if not image_url.startswith('http'):
+                image_url = f"{settings.BASE_URL.rstrip('/')}/media/{image_url.lstrip('/')}"
+            
+            print(f"Attempting to fetch image from: {image_url}")
+
+            # Download image from URL
+            response = requests.get(image_url, verify=False)
+            if response.status_code == 200:
+                # Convert to PIL Image and resize
+                img = PILImage.open(BytesIO(response.content))
+                # Resize image to reasonable dimensions (e.g. 100x100 pixels)
+                img.thumbnail((100, 100))
+                
+                # Save resized image to BytesIO
+                img_byte_arr = BytesIO()
+                img.save(img_byte_arr, format=img.format if img.format else 'PNG')
+                img_byte_arr.seek(0)
+
+                # Create openpyxl image
+                excel_image = Image(img_byte_arr)
+                
+                # Add image to worksheet
+                sheet.add_image(excel_image, cell)
+                
+                # Adjust row height to accommodate image
+                row = int(cell[1:])  # Extract row number from cell reference
+                sheet.row_dimensions[row].height = 75  # Adjust height as needed
+                
+                return True
+            else:
+                print(f"Failed to fetch image. Status code: {response.status_code}")
+            return False
+        except Exception as e:
+            print(f"Error adding image: {str(e)}")
+            return False
+
+    # Collect all parcel data first
+    parcel_data = []
+    
+    for p in Parcel.objects.filter(locality=village, stage=stage).order_by('claim_no'):
+        majina = ''
+        for j in p.parties():
+            majina = majina + j + ","
+        majina = majina + ","
+        majina = majina.replace(",,", "")
+
+        simu = ''
+        for j in p.phones():
+            simu = simu + j + ","
+        simu = simu + ","
+        simu = simu.replace(",,", "")
+
+        sex = ''
+        for j in p.jinsi():
+            sex = sex + j + ","
+        sex = sex + ","
+        sex = sex.replace(",,", "")
+
+        tarehe = ''
+        for j in p.kuzaliwa():
+            tarehe = tarehe + str(j) + ","
+        tarehe = tarehe + ","
+        tarehe = tarehe.replace(",,", "")
+
+        nambaid = ''
+        for j in p.idnamba():
+            nambaid = nambaid + j + ","
+        nambaid = nambaid + ","
+        nambaid = nambaid.replace(",,", "")
+
+        hali = ''
+        for j in p.ulemavu():
+            hali = hali + j + ","
+        hali = hali + ","
+        hali = hali.replace(",,", "")
+
+        ndoa = ''
+        for j in p.ndoa():
+             ndoa = ndoa + j + ","
+        ndoa = ndoa + ","
+        ndoa = ndoa.replace(",,", "")
+
+        # Get party pictures
+        party_pictures = []
+        try:
+            for allocation in p.allocation_set.all():
+                if allocation.party and allocation.party.picture:
+                    image_path = allocation.party.picture.name
+                    party_pictures.append(image_path)
+        except Exception as e:
+            print(f"Error getting party pictures for parcel {p.id}: {str(e)}")
+
+        # Use first party picture if available
+        party_picture = party_pictures[0] if party_pictures else ''
+
+        use = ''
+        if p.current_use is not None:
+            use = p.current_use.name
+        occupancy = ''
+        if p.occupancy_type is not None:
+            occupancy = p.occupancy_type.name
+
+        if stage == 'rejected':
+            remarks = ''
+            for r in p.remarks.all():
+                remarks = remarks + r.description + ","
+            remarks = remarks + ","
+            remarks = remarks.replace(",,", "")
+            
+            parcel_data.append({
+                'wamiliki': majina.upper(),
+                'data': [p.claim_no, majina.upper(), simu, use, occupancy, p.area(), p.locality.name,
+                         p.hamlet.name, str(p.north).replace('--', "'"),
+                         str(p.south).replace('--', "'"), str(p.east).replace('--', "'"), str(p.west).replace('--', "'"),
+                         remarks],
+                'picture': ''
+            })
+        else:
+            parcel_data.append({
+                'wamiliki': majina.upper(),
+                'data': [p.claim_no, p.registration_no, majina.upper(), sex, hali, tarehe, simu, use, occupancy, p.area(), p.locality.name,
+                         p.hamlet.name, str(p.north).replace('--', "'"),
+                         str(p.south).replace('--', "'"), str(p.east).replace('--', "'"), str(p.west).replace('--', "'"), party_picture, nambaid, ndoa],
+                'picture': party_picture
+            })
+
+    # Sort parcel data by wamiliki (owners) in ascending order
+    parcel_data.sort(key=lambda x: x['wamiliki'])
+
+    # Add sorted data to the main data list
+    for parcel in parcel_data:
+        data.append(parcel['data'])
+
+    # Add data to the sheet
+    for row_index, row_data in enumerate(data, start=1):
+        for col_index, cell_data in enumerate(row_data, start=1):
+            col_letter = get_column_letter(col_index)
+            cell = f'{col_letter}{row_index}'
+            
+            # Handle image insertion for party pictures (column Q for non-rejected stage)
+            if stage != 'rejected' and col_index == 17 and row_index > 1 and cell_data:
+                # Clear the URL from the cell
+                sheet[cell] = ''
+                # Insert the image
+                insert_image_to_cell(sheet, cell_data, cell)
+            else:
+                sheet[cell] = cell_data
+
+    # Adjust column width for image column (column Q)
+    if stage != 'rejected':
+        sheet.column_dimensions['Q'].width = 15
+
+    # Set the response headers for Excel file download
+    response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    response['Content-Disposition'] = 'attachment; filename={}'.format(smart_str(f'{village.name}.xlsx'))
+
+    # Save the Workbook to the response
+    wb.save(response)
+
+    return response
+
+
+
+
+
+
+
+#THISI INCLUDES PICTURE
+
+def download_parcel_excelS(request, **kwargs):
+    # Create a new Workbook
+    wb = Workbook()
+    # Select the active sheet
+    sheet = wb.active
+
+    stage = kwargs['stage']
+
+    # Add data to the sheet
+    if stage == 'rejected':
+        data = [
+            ['CLAIM NO', 'WAMILIKI', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 'KITONGOJI', 'KASKAZINI',
+             'KUSINI', 'MASHARIKI', 'MAGHARIBI', 'REASON']
+        ]
+    else:
+        data = [
+            ['CLAIM NO', 'USAJILI NO.', 'WAMILIKI', 'JINSIA', 'ULEMAVU', 'DOB', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 'KITONGOJI',
+             'KASKAZINI', 'KUSINI', 'MASHARIKI', 'MAGHARIBI', 'PICHA', 'NAMBA KITAMBULISHO', 'HALI YA NDOA']
+        ]
+    village = Locality.objects.get(id=request.GET['village_id'])
+
+    # Helper function to insert image to cell
+    def insert_image_to_cell(sheet, image_url, cell):
+        try:
+            # Validate URL
+            if not image_url:
+                return False
+                
+            # Ensure URL has proper scheme
+            if not image_url.startswith('http'):
+                image_url = f"{settings.BASE_URL.rstrip('/')}/media/{image_url.lstrip('/')}"
+            
+            print(f"Attempting to fetch image from: {image_url}")
+
+            # Download image from URL
+            response = requests.get(image_url, verify=False)
+            if response.status_code == 200:
+                # Convert to PIL Image and resize
+                img = PILImage.open(BytesIO(response.content))
+                # Resize image to reasonable dimensions (e.g. 100x100 pixels)
+                img.thumbnail((100, 100))
+                
+                # Save resized image to BytesIO
+                img_byte_arr = BytesIO()
+                img.save(img_byte_arr, format=img.format if img.format else 'PNG')
+                img_byte_arr.seek(0)
+
+                # Create openpyxl image
+                excel_image = Image(img_byte_arr)
+                
+                # Add image to worksheet
+                sheet.add_image(excel_image, cell)
+                
+                # Adjust row height to accommodate image
+                row = int(cell[1:])  # Extract row number from cell reference
+                sheet.row_dimensions[row].height = 75  # Adjust height as needed
+                
+                return True
+            else:
+                print(f"Failed to fetch image. Status code: {response.status_code}")
+            return False
+        except Exception as e:
+            print(f"Error adding image: {str(e)}")
+            return False
+
+    for p in Parcel.objects.filter(locality=village, stage=stage).order_by('claim_no'):
+        majina = ''
+        for j in p.parties():
+            majina = majina + j + ","
+        majina = majina + ","
+        majina = majina.replace(",,", "")
+
+        simu = ''
+        for j in p.phones():
+            simu = simu + j + ","
+        simu = simu + ","
+        simu = simu.replace(",,", "")
+
+        sex = ''
+        for j in p.jinsi():
+            sex = sex + j + ","
+        sex = sex + ","
+        sex = sex.replace(",,", "")
+
+        tarehe = ''
+        for j in p.kuzaliwa():
+            tarehe = tarehe + str(j) + ","
+        tarehe = tarehe + ","
+        tarehe = tarehe.replace(",,", "")
+
+        nambaid = ''
+        for j in p.idnamba():
+            nambaid = nambaid + j + ","
+        nambaid = nambaid + ","
+        nambaid = nambaid.replace(",,", "")
+
+        hali = ''
+        for j in p.ulemavu():
+            hali = hali + j + ","
+        hali = hali + ","
+        hali = hali.replace(",,", "")
+
+        ndoa = ''
+        for j in p.ndoa():
+             ndoa = ndoa + j + ","
+        ndoa = ndoa + ","
+        ndoa = ndoa.replace(",,", "")
+
+        # Get party pictures
+        party_pictures = []
+        try:
+            for allocation in p.allocation_set.all():
+                if allocation.party and allocation.party.picture:
+                    image_path = allocation.party.picture.name
+                    party_pictures.append(image_path)
+        except Exception as e:
+            print(f"Error getting party pictures for parcel {p.id}: {str(e)}")
+
+        # Use first party picture if available
+        party_picture = party_pictures[0] if party_pictures else ''
+
+        use = ''
+        if p.current_use is not None:
+            use = p.current_use.name
+        occupancy = ''
+        if p.occupancy_type is not None:
+            occupancy = p.occupancy_type.name
+
+        if stage == 'rejected':
+            remarks = ''
+            for r in p.remarks.all():
+                remarks = remarks + r.description + ","
+            remarks = remarks + ","
+            remarks = remarks.replace(",,", "")
+            data.append(
+                [p.claim_no, majina.upper(), simu, use, occupancy, p.area(), p.locality.name,
+                 p.hamlet.name, str(p.north).replace('--', "'"),
+                 str(p.south).replace('--', "'"), str(p.east).replace('--', "'"), str(p.west).replace('--', "'"),
+                 remarks])
+        else:
+            data.append(
+                [p.claim_no, p.registration_no, majina.upper(), sex, hali, tarehe, simu, use, occupancy, p.area(), p.locality.name,
+                 p.hamlet.name, str(p.north).replace('--', "'"),
+                 str(p.south).replace('--', "'"), str(p.east).replace('--', "'"), str(p.west).replace('--', "'"), party_picture, nambaid, ndoa])
+
+    # Add data to the sheet
+    for row_index, row_data in enumerate(data, start=1):
+        for col_index, cell_data in enumerate(row_data, start=1):
+            col_letter = get_column_letter(col_index)
+            cell = f'{col_letter}{row_index}'
+            
+            # Handle image insertion for party pictures (column Q for non-rejected stage)
+            if stage != 'rejected' and col_index == 17 and row_index > 1 and cell_data:
+                # Clear the URL from the cell
+                sheet[cell] = ''
+                # Insert the image
+                insert_image_to_cell(sheet, cell_data, cell)
+            else:
+                sheet[cell] = cell_data
+
+    # Adjust column width for image column (column Q)
+    if stage != 'rejected':
+        sheet.column_dimensions['Q'].width = 15
+
+    # Set the response headers for Excel file download
+    response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    response['Content-Disposition'] = 'attachment; filename={}'.format(smart_str(f'{village.name}.xlsx'))
+
+    # Save the Workbook to the response
+    wb.save(response)
+
+    return response
+
+
+
+class CCROCreateRemarkListView(APIView):
+    # @transaction.atomic
+    def post(self, request):
+
+        message = ''
+        http_status = status.HTTP_201_CREATED
+        try:
+            remark = Remark(action=request.data['action'], description=request.data['description'],
+                            created_by=request.user)
+            remark.save()
+
+            parcel = Parcel.objects.get(id=request.data['parcelId'])
+            if remark.action == 'approve':
+                if parcel.stage == 'gis_approval' or parcel.stage == 'draft':
+
+                    parcel = register_parcel(parcel)
+                    if parcel.uka_namba == None:
+                        transaction.set_rollback(True)
+                        message = 'Bad Locality Setup Information'
+                        remark = Remark(action=request.data['action'], description=message)
+                        remark.save()
+                        return Response({
+                            'message': message,
+                        }, status=http_status)
+
+                    parcel.save()
+
+                    from libs.docs.ccro import generate_ccro
+                    # from libs.docs.adjudication import generate_adjudication
+                    # from libs.docs.trans_sheet import generate_transaction
+
+                    # generate_ccro(parcel.id)
+                    # generate_transaction(parcel.id)
+                    # generate_adjudication.delay(parcel.id)
+
+                    # save_history(parcel.project_id, 'Registration', f'{parcel.id} was registered', 17,
+                    #              'ccro_registered_data')
+
+                if parcel.stage == 'rejected':
+                    if parcel.uka_namba is not None:
+                        parcel.stage = 'registered'
+                    else:
+                        parcel.stage = 'gis_approval'
+
+                    save_history(parcel.project_id, 'Activation', f'{parcel.id} was active', 17,
+                                 'ccro_registered_data')
+            else:
+                save_history(parcel.project_id, 'Rejection', f'{parcel.id} was rejected', 9,
+                             'ccro_rejected_data')
+                parcel.stage = 'rejected'
+            parcel.remarks.add(remark)
+            parcel.save()
+
+            save_history(parcel.project_id, 'Create', f'{remark.id} was created', request.data['task_id'],
+                         request.data['screen_code'])
+
+        except Exception as e:
+            message = str(e)
+            http_status = status.HTTP_400_BAD_REQUEST
+            traceback.print_exc()
+            # transaction.set_rollback(True)
+
+        return Response({
+            'message': message,
+        }, status=http_status)
+
+
+class CCRORemarkListView(APIView):
+
+    def get(self, request, **kwargs):
+        results = []
+        for d in Parcel.objects.get(id=kwargs['pk']).remarks.all():
+            results.append({
+                'id': d.id,
+                'action': d.action,
+                'description': d.description,
+                'datetime': d.datetime(),
+                'created_by': d.created_user()
+            })
+
+        return Response({
+            'results': results
+        })
+
+
+class CCROGenerateDocumentView(APIView):
+    def post(self, request):
+
+        parcel_id = request.data['parcel_id']
+        document = int(request.data['document'])
+
+        parcel = Parcel.objects.get(id=parcel_id)
+
+        kijiji = parcel.locality.name.strip().strip().replace("'", '_')
+        kijiji = kijiji.replace(' ', '_')
+        kijiji = kijiji.replace('"', '_')
+
+        kitongoji = parcel.hamlet.name.strip().replace("'", '_')
+        kitongoji = kitongoji.replace(' ', '_')
+        kitongoji = kitongoji.replace('"', '_')
+        uuid = 'uuid'
+
+        task = None
+        output = ''
+        if document == 0:
+            task = generate_ccro.delay(parcel_id)
+            out = f'{DOCS_OUTPUT}ccro/{kijiji}/{kitongoji}'.replace("'", '_').replace(' ', '_').replace('"', '_')
+            output = f'{out}/ccro_{parcel_id}_{uuid}.pdf'
+        if document == 1:
+            task = generate_transaction.delay(parcel_id)
+            out = f'{DOCS_OUTPUT}trans/{kijiji}/{kitongoji}'.replace("'", '_').replace(' ', '_').replace('"', '_')
+            output = f'{out}/trans_{parcel_id}_{uuid}.pdf'
+
+        return Response({
+            'task_id': task.id,
+            'task_state': task.state,
+            'task_ready': task.ready(),
+            'output': output.replace('/data/nluis', config('FILE_SERVER'))
+        })
+
+    def get(self, request):
+        task_id = request.GET['task_id']
+        task = AsyncResult(task_id)
+        if task.state == 'FAILURE' or task.state == 'PENDING':
+            response = {
+                'task_id': task_id,
+                'state': task.state,
+                'progression': "None",
+                'info': str(task.info)
+            }
+        else:
+            current = task.info.get('current', 0)
+            total = task.info.get('total', 1)
+            progression = (int(current) / int(total)) * 100  # to display a percentage of progress of the task
+            response = {
+                'task_id': task_id,
+                'state': task.state,
+                'progression': f'{progression:,.2f}',
+                'info': "None"
+            }
+        return Response(response, status=200)
+
+        # return Response({
+        #     'path': path
+        # })
+
+
+class CCRODocumentListView(APIView):
+    def get(self, request, **kwargs):
+        pk = kwargs['pk']
+        parcel = Parcel.objects.get(id=pk)
+        # docs = generate_ccro(pk)
+        # rans = generate_transaction(pk)
+        # adjudication = generate_adjudication(pk)
+
+        documents = []
+        server = config('SERVER')
+
+        for d in ['CCRO', 'Transaction Sheet']:  # parcel.documents.order_by('-id').all():
+            # base_64 = str(base64.b64encode(
+            #     d.file.read())).replace('b\'', '')
+            # base_64 = base_64.replace('\'', '')
+            documents.append({
+                'name': d,
+                'datetime': '',  # d.datetime(),
+                'file': '',  # f'{server}{d.file.url}',  # f'data:application/pdf;base64,{base_64}'
+            })
+
+        return Response({
+            'results': documents
+        })
+
+
+class CCROChangeStageListView(APIView):
+    def put(self, request):
+        status = 0
+        message = ''
+        try:
+            stage = request.data['stage']
+            parcel = Parcel.objects.get(id=request.data['parcel_id'])
+            parcel.stage = request.data['stage']
+            parcel.save(update_fields=['stage'])
+
+            if stage == 'printed':
+                save_history(parcel.project_id, 'Update', f'{parcel.id} was updated', 17, 'ccro_printed')
+
+            status = 1
+        except Exception as e:
+            message = str(e)
+        return Response({
+            'results': status,
+            'message': message
+        })
+
+
+class QuestionnairesListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, **kwargs):
+        results = []
+        has_answers = kwargs['has_answers']
+        project = Project.objects.get(id=kwargs['project_id'])
+        flag = kwargs['flag']
+        is_analysis = kwargs['is_analysis']
+
+        for q in Category.objects.filter(project_type=project.project_type, flag=flag):
+            if has_answers == 1:
+                forms = Form.objects.filter(category=q, is_default=True).order_by('order_no')
+            else:
+                forms = Form.objects.filter(category=q).order_by('order_no')
+
+            list = forms
+            if is_analysis == 1:
+                list = []
+                for form in forms:
+                    for qn in form.questions():
+                        if (qn.data_type == 'number' or qn.data_type == 'radio' or qn.data_type == 'select'
+                                or qn.data_type == 'check'):
+                            list.append(form.id)
+
+            forms = Form.objects.filter(id__in=list).values('id', 'name')
+            results.append({
+                'id': q.id,
+                'name': q.name,
+                'forms': forms
+            })
+
+        regions = []
+        districts = []
+        wards = []
+        villages = []
+        hamlets = []
+        level = project.project_type.level
+
+        if str(level.name).lower() == 'village':
+            try:
+                village = project.localites.all()
+                hamlet = Locality.objects.filter(parent__in=village)
+                ward = Locality.objects.filter(id=village[0].parent.id)
+                dist = Locality.objects.filter(id=ward[0].parent.id)
+                region = Locality.objects.filter(id=dist[0].parent.id)
+
+                regions = region.values('id', 'name')
+                districts = dist.values('id', 'name', 'parent')
+                wards = ward.values('id', 'name', 'parent')
+                villages = village.values('id', 'name', 'parent')
+                hamlets = hamlet.values('id', 'name', 'parent')
+
+            except Exception as e:
+                print(e)
+                traceback.print_exc()
+
+        return Response({
+            'results': results,
+            'project': {
+                'id': project.id,
+                'name': project.name,
+                'level': level.name
+            },
+            'localities': {
+                'regions': regions,
+                'districts': districts,
+                'wards': wards,
+                'villages': villages,
+                'hamlets': hamlets
+            }
+        })
+
+
+class QuestionnairesFormsListView(APIView, LimitOffsetPagination):
+    permission_classes = [AllowAny]
+
+    def get(self, request, **kwargs):
+        results = []
+        has_answers = kwargs['has_answers']
+        is_monitoring = kwargs['is_monitoring']
+
+        try:
+            form_id = kwargs['form_id']
+            project = Project.objects.get(id=kwargs['project_id'])
+
+            if has_answers == 1:
+                qs = Form.objects.filter(id__in=[form_id], is_default=True).order_by('order_no')
+            else:
+                qs = Form.objects.filter(category_id=form_id).order_by('order_no')
+
+            for f in qs.order_by('order_no'):
+
+                form_fields = [{
+                    'id': 1,
+                    'form_field': 'Claim No'
+                }]
+
+                if has_answers == 1:
+                    ffields = FormField.objects.exclude(parent__isnull=False).filter(form=f).order_by('order_no')
+                else:
+                    ffields = FormField.objects.filter(form=f).order_by('order_no')
+
+                count = 1
+                for ff in ffields:
+                    if has_answers:
+                        if count > 6:
+                            break
+                    count += 1
+
+                    form_fields.append({
+                        'id': ff.id,
+                        'form_field': ff.form_field,
+                        'data_type': ff.data_type,
+                        'options': ff.options,
+                        'required': ff.required,
+                        'error_message': ff.error_message,
+                        'hint': ff.hint,
+                        'flag': ff.flag,
+                        'parent': ff.parent.id if ff.parent is not None else 0,
+                        'parent_value': ff.parent_value
+                    })
+
+                answers = []
+
+                if has_answers == 1:
+                    if is_monitoring == 1:
+                        form_answers = FormAnswerQuestionnaire.objects.filter(project=project, form_field__form=f) \
+                            .distinct('claim_no')
+                    else:
+                        form_answers = FormAnswer.objects.filter(project=project, form_field__form=f).distinct(
+                            'claim_no')
+
+                    for a in form_answers:
+                        jibu = [{
+                            'field': 1,
+                            'answer': a.claim_no
+                        }]
+
+                        count = 1
+                        for ff in ffields:
+                            if has_answers:
+                                if count > 6:
+                                    break
+                            count += 1
+
+                            jibu.append({
+                                'field': ff.id,
+                                'answer': (str(val_answer(a.claim_no, ff.id, is_monitoring)).upper().replace("--", "'")
+                                           if ff.data_type != 'file'
+                                           else str(val_answer(a.claim_no, ff.id, is_monitoring)).replace("--", "'"))
+                            })
+                        answers.append({
+                            'row': jibu
+                        })
+                results.append({
+                    'id': f.id,
+                    'name': f.name,
+                    'form_fields': form_fields,
+                    'answers': answers
+                })
+
+
+        except Exception as e:
+            traceback.print_exc()
+            print(e)
+
+        # paginator = LimitOffsetPagination()
+        # result_page = paginator.paginate_queryset(results, request)
+        # serializer = NewsItemSerializer(result_page, many=True, context={'request': request})
+        result_page = self.paginate_queryset(results, request, view=self)
+        # serializer = NewsItemSerializer(results, many=True)
+        return self.get_paginated_response(result_page)
+        # response = Response(result_page, status=status.HTTP_200_OK)
+        # return response
+        # return Response({
+        #     'results': results
+        # })
+
+
+class QuestionnairesCreateAnswerView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, **kwargs):
+        message = ''
+        status = HTTP_201_CREATED
+
+        print(request.data)
+
+        try:
+            claim_no = request.data['claim_no']
+            form_field_id = request.data['form_field_id']
+            project_id = request.data['project_id']
+            is_monitoring = request.data['is_monitoring']
+            response = request.data['response']
+            file = request.data['file']
+            leo = str(datetime.datetime.now())
+            project = Project.objects.get(id=request.data['project_id'])
+            document_type_id = request.data['document_type_id']
+            document_type = DocumentType.objects.get(id=document_type_id)
+            description = request.data['description']
+            task_id = request.data['task_id']
+
+            if file != '':
+                appuser = AppUser.objects.get(user=request.user)
+                document = Document(
+                    project=project,
+                    locality=appuser.station.locality,
+                    document_type=document_type,
+                    description=description,
+                    file=file,
+                    task=Task.objects.get(id=task_id)
+                )
+                document.save()
+
+            try:
+                if is_monitoring == 1 or is_monitoring == '1':
+                    obj, created = FormAnswerQuestionnaire.objects.update_or_create(
+                        claim_no=claim_no, form_field_id=form_field_id,
+                        defaults={'response': response, 'local_answer_date': leo, 'project_id': project_id,
+                                  'file': file},
+                    )
+                else:
+                    obj, created = FormAnswer.objects.update_or_create(
+                        claim_no=claim_no, form_field_id=form_field_id,
+                        defaults={'response': response, 'local_answer_date': leo, 'project_id': project_id,
+                                  'file': file},
+                    )
+
+            except Exception as e:
+                print(e)
+                message = str(e)
+
+        except Exception as e:
+            traceback.print_exc()
+            message = str(e)
+            status = HTTP_409_CONFLICT
+
+        return Response({
+            'status': status,
+            'message': message
+        }, status)
+
+
+class QuestionnairesAnalyseView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, **kwargs):
+        results = []
+
+        try:
+            form_id = kwargs['form_id']
+            project = Project.objects.get(id=kwargs['project_id'])
+
+            categories = []
+            localities = []
+
+            for loc in Locality.objects.filter(id=project.localites.first().id):
+                categories.append(loc.name)
+                localities.append(loc)
+
+            for f in FormField.objects.filter(form_id=form_id, data_type__in=['radio', 'check', 'select', 'number']):
+                data = []
+                total = 0
+
+                series = []
+                if f.data_type == 'number':
+                    count = int(FormAnswerQuestionnaire.objects.filter(project=project, form_field=f)
+                                .aggregate(Max('response'))['response__max'])
+                    data.append([f.form_field, count])
+                    total = count
+
+                    series.append({
+                        'name': f.form_field,
+                        'data': data
+                    })
+
+                else:
+                    for d in f.options.split(','):
+                        count = FormAnswerQuestionnaire.objects.filter(project=project, form_field=f, response=d) \
+                            .count()
+                        data.append([d, count])
+                        total += count
+
+                        series_data = []
+                        for loc in localities:
+                            # series_data.append(FormAnswer.objects.filter(locality=loc).count())
+                            series_data.append(count)
+
+                        series.append({
+                            'name': d,
+                            'data': series_data
+                        })
+
+                form_fields = {
+                    'id': f.id,
+                    'name': f.form_field if f.placeholder is None else f.placeholder,
+                    'data': data,
+                    'categories': categories,
+                    'series': series,
+                    'total': total
+                }
+                results.append(form_fields)
+        except Exception as e:
+            traceback.print_exc()
+            print(e)
+        return Response({
+            'results': results
+        })
+
+
+class QuestionnairesMonitoringListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, **kwargs):
+        results = []
+        has_answers = kwargs['has_answers']
+        project_type = ProjectType.objects.get(id=kwargs['project_type_id'])
+        flag = kwargs['flag']
+
+        for q in Category.objects.filter(project_type=project_type, flag=flag):
+            if has_answers == 1:
+                forms = Form.objects.values('id', 'name').filter(category=q, is_default=True).order_by('order_no')
+            else:
+                forms = Form.objects.values('id', 'name').filter(category=q).order_by('order_no')
+
+            results.append({
+                'id': q.id,
+                'name': q.name,
+                'forms': forms
+            })
+        return Response({
+            'results': results,
+        })
+
+
+class QuestionnairesMonitoringFormsListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, **kwargs):
+        results = []
+        has_answers = kwargs['has_answers']
+
+        try:
+            form_id = kwargs['form_id']
+
+            if has_answers == 1:
+                qs = Form.objects.filter(id__in=[form_id], is_default=True).order_by('order_no')
+            else:
+                qs = Form.objects.filter(category_id=form_id).order_by('order_no')
+
+            for f in qs.order_by('order_no'):
+
+                form_fields = [{
+                    'id': 0,
+                    'form_field': 'Claim No'
+                }]
+
+                if has_answers == 1:
+                    ffields = FormField.objects.exclude(parent__isnull=False).filter(form=f).order_by('order_no')
+                else:
+                    ffields = FormField.objects.filter(form=f).order_by('order_no')
+
+                count = 0
+                for ff in ffields:
+                    if has_answers:
+                        if count > 6:
+                            break
+                    count += 1
+
+                    form_fields.append({
+                        'id': ff.id,
+                        'form_field': ff.form_field,
+                        'data_type': ff.data_type,
+                        'options': ff.options,
+                        'required': ff.required,
+                        'error_message': ff.error_message,
+                        'hint': ff.hint,
+                        'flag': ff.flag,
+                        'parent': ff.parent.id if ff.parent is not None else 0,
+                        'parent_value': ff.parent_value
+                    })
+
+                answers = []
+
+                results.append({
+                    'id': f.id,
+                    'name': f.name,
+                    'form_fields': form_fields,
+                    'answers': answers
+                })
+
+
+        except Exception as e:
+            traceback.print_exc()
+            print(e)
+        return Response({
+            'results': results
+        })
+
+
+class CCROUpdatePartyView(APIView):
+    def put(self, request):
+        message = ''
+        try:
+
+            party = Party.objects.get(id=request.data['party_id'])
+            field = request.data['field']
+            value = request.data['value']
+
+            if field == 'first_name':
+                party.first_name = str(value).title()
+            if field == 'middle_name':
+                party.middle_name = str(value).title()
+            if field == 'last_name':
+                party.last_name = str(value).title()
+            if field == 'gender':
+                party.gender = str(value).title()
+            if field == 'picture':
+                party.picture = request.FILES.get('picture'),
+            party.save()
+            status = 1
+        except Exception as e:
+            message = str(e)
+            status = 0
+        return Response({
+            'status': status,
+            'message': message
+        })
+
+
+class CCROUpdatePartyPictureView(APIView):
+    def put(self, request):
+        message = ''
+        try:
+            extra = json.loads(request.data['extra'])
+            party_id = int(extra['party_id'])
+            party = Party.objects.get(id=party_id)
+            image_file = request.FILES['picture']
+            party.picture.save(image_file.name, image_file, save=True)
+            party.save()
+            status = 1
+        except Exception as e:
+            message = str(e)
+            status = 0
+        return Response({
+            'status': status,
+            'message': message
+        })
+
+
+class DeburgView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, **kwargs):
+        what = kwargs['what']
+        who = kwargs['who']
+        filename = kwargs['file']
+        project_id = kwargs['project_id']
+        user = User.objects.get(id=who)
+        team_member = TeamMember.objects.get(user=user)
+
+        if what == 'temp':
+            for fh in TemporaryFile.objects.filter(file='files/' + filename):
+                try:
+                    response = populate_mobile_data2(team_member.id, fh.file.path, project_id)
+                    status = response['status']
+                    message = response['message']
+
+                    print(f'{status} - {message}')
+                except Exception as e:
+                    pass
+            return Response({
+                'status': 'status',
+                'message': message
+            })
+
+
+class QuestionnairesMonitoringVerificationView(APIView, LimitOffsetPagination):
+
+    def get(self, request, **kwargs):
+        results = []
+
+        try:
+            form_id = kwargs['form_id']
+            project = Project.objects.get(id=kwargs['project_id'])
+
+            qs = Form.objects.filter(id__in=[form_id], is_default=True).order_by('order_no')
+
+            for f in qs.order_by('order_no'):
+
+                form_fields = [{
+                    'id': 1,
+                    'form_field': 'Claim No'
+                }]
+
+                ffields = FormField.objects.exclude(parent__isnull=False).filter(form=f).order_by('order_no')
+
+                count = 1
+                for ff in ffields:
+                    # if has_answers:
+                    #     if count > 6:
+                    #         break
+                    count += 1
+
+                    form_fields.append({
+                        'id': ff.id,
+                        'form_field': ff.form_field,
+                        'data_type': ff.data_type,
+                        'options': ff.options,
+                        'required': ff.required,
+                        'error_message': ff.error_message,
+                        'hint': ff.hint,
+                        'flag': ff.flag,
+                        'parent': ff.parent.id if ff.parent is not None else 0,
+                        'parent_value': ff.parent_value
+                    })
+
+                answers = []
+                form_answers = []
+                for ff in ffields:
+                    print("yente")
+                    if ff.parent_value is not None:
+                        parent_values = str_to_list(ff.parent_value)
+                        print(parent_values)
+                        for p_id in parent_values:
+                            print(p_id)
+                            form_answers = FormAnswerQuestionnaire.objects.filter(project=project, form_field__id=p_id) \
+                                .order_by('claim_no').distinct('claim_no')
+                            print(form_answers)
+                            jibu = [{
+                                'field': 1,
+                                'answer': a.claim_no
+                            }]
+
+                            answers.append({
+                                'row': jibu
+                            })
+                            jibu.append({
+                                'field': ff.id,
+                                'answer': (str(val_answer(a.claim_no, ff.id, is_monitoring)).upper().replace("--", "'")
+                                           if ff.data_type != 'file'
+                                           else str(val_answer(a.claim_no, ff.id, is_monitoring)).replace("--", "'"))
+                            })
+                            answers.append({
+                                'row': jibu
+                            })
+
+                for a in form_answers:
+                    print("yetee")
+                    print(a)
+                    jibu = [{
+                        'field': 1,
+                        'answer': a.claim_no
+                    }]
+
+                    answers.append({
+                        'row': jibu
+                    })
+
+                    count = 1
+                    for ff in ffields:
+                        # if has_answers:
+                        #     if count > 6:
+                        #         break
+                        #     count += 1
+
+                        jibu.append({
+                            'field': ff.id,
+                            'answer': (str(val_answer(a.claim_no, ff.id, is_monitoring)).upper().replace("--", "'")
+                                       if ff.data_type != 'file'
+                                       else str(val_answer(a.claim_no, ff.id, is_monitoring)).replace("--", "'"))
+                        })
+                        answers.append({
+                            'row': jibu
+                        })
+                results.append({
+                    'id': f.id,
+                    'name': f.name,
+                    'form_fields': form_fields,
+                    'answers': answers
+                })
+
+        except Exception as e:
+            traceback.print_exc()
+            print(e)
+
+        result_page = self.paginate_queryset(results, request, view=self)
+        return self.get_paginated_response(result_page)
+
+
+class QuestionnairesDownloadSHP(APIView):
+
+    def post(self, request):
+        status = 0
+        message = ''
+        project_id = request.data['project_id']
+        village_id = request.data['village_id']
+
+        qs_answer = FormAnswer.objects.filter(
+            form_field__form__category__flag='dodoso',
+            response__istartswith='polygon',
+            locality__parent_id=village_id).order_by(
+            'claim_no').distinct('claim_no')
+
+        task = qn_download_shp.delay(village_id, project_id)
+        locality_name = Locality.objects.get(id=village_id).name
+        return Response({
+            'task_id': task.id,
+            'task_state': task.state,
+            'task_ready': task.ready(),
+            'locality_name': locality_name,
+            'count': qs_answer.count()
+        })
+
+    def get(self, request):
+
+        task_id = request.GET['task_id']
+        task = AsyncResult(task_id)
+        if task.state == 'FAILURE' or task.state == 'PENDING':
+            response = {
+                'task_id': task_id,
+                'state': task.state,
+                'progression': "None",
+                'info': str(task.info)
+            }
+        else:
+            current = task.info.get('current', 0)
+            total = task.info.get('total', 1)
+            progression = (int(current) / int(total)) * 100  # to display a percentage of progress of the task
+            response = {
+                'task_id': task_id,
+                'state': task.state,
+                'progression': f'{progression:,.2f}',
+                'info': "None"
+            }
+        return Response(response, status=200)
+
+
+
+
+#FOR API INTEGRATION
+
+def parcel_data(request, **kwargs):
+        stage = kwargs['stage']
+
+        # Define headers based on the stage
+        if stage == 'rejected':
+            headers = ['CLAIM NO', 'WAMILIKI', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 'KITONGOJI', 
+                    'KASKAZINI', 'KUSINI', 'MASHARIKI', 'MAGHARIBI', 'REASON']
+        else:
+            headers = ['HATI NAMBA', 'WAMILIKI', 'SIMU', 'MATUMIZI', 'UMILIKI', 'UKUBWA(SQM)', 'KIJIJI', 
+                    'KITONGOJI', 'AINA YA KITAMBULISHO', 'NAMBA YA KITAMBULISHO', 'PICHA', 'JIRA NUKTA']
+
+        # Get the village based on the ID from the request parameters
+        village = Locality.objects.get(id=request.GET['village_id'])
+        data = []
+
+        # Iterate through parcels and build the JSON data
+        for p in Parcel.objects.filter(locality=village, stage=stage).order_by('claim_no'):
+            majina = ','.join(p.parties()).upper()
+            simu = ','.join(p.phones())
+            use = p.current_use.name if p.current_use is not None else ''
+            occupancy = p.occupancy_type.name if p.occupancy_type is not None else ''
+        #collect party information
+            parties = Allocation.objects.filter(parcel=p).select_related('party')
+            ainaid = ','.join([party.party.id_type for party in parties if party.party.id_type])
+            nambaid = ','.join([party.party.id_no for party in parties if party.party.id_no])
+            image = ','.join([f"{settings.BASE_URL}{party.party.picture.url}" if party.party.picture else '' for party in parties])
+
+            jira = ''
+            linear_ring = p.jiranukta()
+            if hasattr(linear_ring, 'coords'):
+            # This assumes linear_ring is a geometry object with coords attribute
+                   jira = ', '.join([f"{point[0]}, {point[1]}" for point in linear_ring.coords])
+            elif isinstance(linear_ring, (list, tuple)):
+                   jira = ', '.join(str(item) for item in linear_ring)
+            else:
+                   jira = str(linear_ring)
+
+            row_data = [
+                #p.claim_no,
+                p.registration_no if stage != 'rejected' else '',
+                majina,
+                simu,
+                use,
+                occupancy,
+                p.area(),
+                p.locality.name,
+                p.hamlet.name,
+                ainaid,
+                nambaid,
+                image,
+                jira  
+   #             str(p.north).replace('--', "'"),
+  #              str(p.south).replace('--', "'"),
+ #               str(p.east).replace('--', "'"),
+#                str(p.west).replace('--', "'")
+            ]
+
+            if stage == 'rejected':
+                remarks = ','.join([r.description for r in p.remarks.all()])
+                row_data.append(remarks)
+            
+            # Adjust the row_data based on the headers
+            if stage == 'rejected':
+                row_data.pop(1)  # Remove 'USAJILI NO.' if not needed
+
+            # Construct a dictionary for each row and add to data list
+            row_dict = dict(zip(headers, row_data))
+            data.append(row_dict)
+
+        # Return the data as a JSON response
+        return JsonResponse(data, safe=False)
+
+
+#LISTING  CCROs PRODUCED VILLAGES
+class CCROVillageListView(APIView):
+    permission_classes = [IsAuthenticated]
+    def get(self, request):
+        try:
+            # Directly use project_type_id = 6 for CCRO projects
+            villages = Locality.objects.filter(
+                project__project_type_id=6,
+                level_id=1 #village level
+            ).distinct().values('id','name').order_by('name')
+
+            return Response({
+                'status': 1,
+                'villages': villages
+            })
+        except Exception as e:
+            return Response({
+                'status': 0,
+                'message': str(e)
+            })
+
+
+
+
+
+# COUNTING THE NUMBER OF CCROS ISSUED
+
+class CCROParcelCountView(APIView):
+    permission_classes = [AllowAny]
+    def get(self, request, **kwargs):
+        try:
+            # Get parcels excluding specified stages
+            parcel_count = Parcel.objects.exclude(
+                stage__in=['draft data', 'rejected', 'gis_approval']
+            
+            ).count()
+
+            return Response({
+                'status': 1,
+                'count': parcel_count
+            })
+        except Exception as e:
+            return Response({
+                'status': 0,
+                'message': str(e)
+
+            })

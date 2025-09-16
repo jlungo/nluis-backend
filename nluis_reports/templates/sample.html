@@ -1,0 +1,87 @@
+<head>
+    <style>
+        body {
+            margin: auto;
+            width:80%;
+            border: 2px #e0e0e0 solid;
+            padding: 4%;
+            font-family: sans serif;
+           
+          }
+          
+          #page-container {
+            position: relative;
+            min-height: 100vh;
+          }
+          
+          #content-wrap {
+            padding-bottom: 2.5rem; /* Footer height */
+            text-align:center;
+          }
+          .main_header {
+            text-align: center;
+            margin-top: 20px;
+            margin-bottom: 20px;
+          }
+              
+          div.separator {
+            border-top: 1px dashed #8c8b8b;
+          }
+
+          table {
+            width:100%;
+            height:auto;
+            border-collapse: collapse;
+            margin: 25px 0;
+            font-size: 0.9em;
+            font-family: sans-serif;
+            min-width: 400px;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.15);
+          }
+
+          table thead tr {
+            color: #080808;
+            text-align: left;
+        }
+
+        table th,td {
+            padding: 12px 15px;
+            text-align: left;
+        }
+        table tbody tr {
+          border-bottom: 1px solid #dddddd;
+      }
+      
+      table tbody tr:nth-of-type(even) {
+          background-color: #f3f3f3;
+      }
+      
+      table tbody tr:last-of-type {
+          border-bottom: 2px solid;
+      }
+          
+    </style>
+  </head>
+  
+  <div id="page-container">
+    <div id="content-wrap">
+      <!-- all other page content -->
+      <div class="main_header">
+        <table class='' width="100%">
+            <tr>
+            <td width="100%" style="text-align: center; font-size: 13px">
+              <div style="clear:both;"></div>
+              <p>
+                <img src="" class="logo"  style="max-width:80px;" >
+                <h3>The United Republic of Tanzania</h3>
+                <h2>The National Land Use Commission</h2>
+                <h3>  {{title}}</h3>
+              </p>
+            </td>
+          </tr>
+        </table>
+      {{df|safe}}
+      <br>
+      </div>
+  </div>
+  

@@ -1,0 +1,98 @@
+body {
+  margin: auto;
+  border: 2px #e0e0e0 solid;
+  /*margin:1%;*/
+  padding: 3%;
+  font-family: monospaced sans serif;
+}
+
+#page-container {
+  position: relative;
+  min-height: 100vh;
+}
+
+#content-wrap {
+  padding-bottom: 2.5rem; /* Footer height */
+}
+
+#footer {
+  position: absolute;
+  bottom: 0;
+  width: 100%;
+  height: 2.5rem; /* Footer height */
+  font-family: Trebuchet MS;
+  font-size: 12px;
+}
+
+table {
+  /*border-color:#e0e0e0;*/
+  width: 100%;
+  font-size: 14px;
+  border: 0px solid #c5c5c5;
+}
+
+.table td {
+  border: 0.3px solid #edebeb;
+  padding: 5px;
+}
+
+table th {
+  border: 1px solid;
+  padding: 5px;
+  text-align: left;
+  font-size: 12px;
+}
+
+.header td:first-child {
+  width: 16%;
+}
+.header td:last-child {
+  width: 56%;
+  text-align: right;
+}
+.header td:nth-child(2) {
+  width: 22%;
+}
+.description td:first-child {
+  width: 16%;
+}
+.description td:last-child {
+  width: 56%;
+  text-align: left;
+  padding-left: 3%;
+}
+.description td:nth-child(2) {
+  width: 22%;
+}
+.description {
+  margin-top: 0px;
+  margin-bottom: 5px;
+}
+.amount {
+  text-align: right;
+}
+
+.main_header {
+  text-align: center;
+  margin-top: 20px;
+  margin-bottom: 20px;
+}
+.info {
+  text-align: center;
+  margin-bottom: 5px;
+}
+
+.total {
+  font-weight: 600;
+}
+.signature td:first-child {
+  width: 16%;
+}
+.signature td:last-child {
+  width: 56%;
+  text-align: left;
+}
+
+div.separator {
+  border-top: 1px dashed #8c8b8b;
+}
